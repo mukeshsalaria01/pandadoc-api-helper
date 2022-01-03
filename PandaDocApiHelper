@@ -1,0 +1,180 @@
+using Newtonsoft.Json;
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Web.Script.Serialization;
+
+namespace Adaptability.Core.Helpers
+{
+
+    public static class PandaDocApiHelper
+    {
+        public static string API_BASE_URL = "https://api.pandadoc.com/public/v1/";
+        //Sandbox API KEY
+        //Please change KEY with your Key before use
+        public static string API_KEY = "API-Key c345729202efdc4977e7075beCad80aeef2c5715"; 
+
+        /// <summary>
+        /// Panda doc response
+        /// </summary>
+        public class PandDocCreateResponse
+        {
+            public string id { get; set; }
+            public string name { get; set; }
+            public string status { get; set; }
+            public DateTime date_created { get; set; }
+            public DateTime date_modified { get; set; }
+            public object expiration_date { get; set; }
+            public object version { get; set; }
+            public string uuid { get; set; }
+            public object expires_at { get; set; }
+        }
+
+        /// <summary>
+        /// 1. Create document from existing PDF
+        /// Reference: https://developers.pandadoc.com/reference/new-document#create-document-from-pdf
+        /// </summary>
+        /// <param name="fileUrl"></param>
+        /// <param name="userEmail"></param>
+        /// <param name="firstName"></param>
+        /// <param name="lastName"></param>
+        /// <returns></returns>
+        public static string CreateDocumentFromPdfFieldTags(string fileUrl, string userEmail, string firstName, string lastName)
+        {
+            try
+            {
+                var createApi = API_BASE_URL + "documents";
+                ServicePointManager.Expect100Continue = true;
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+
+                HttpClient client = new HttpClient();
+                client.DefaultRequestHeaders.Add("Accept", "*/*");
+                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("multipart/form-data"));
+                client.DefaultRequestHeaders.Add("Authorization", API_KEY);
+
+                // we need to send a request with multipart/form-data
+                var multiForm = new MultipartFormDataContent();
+
+                // NOTE: Make sure you have Role (Parent) as we set parent in pdf while generation. Otherwise it won't save
+                // add API method parameters
+                multiForm.Add(new StringContent("{\"name\": \"" + Path.GetFileNameWithoutExtension(fileUrl) + "\",\"recipients\": [{ \"email\": \"" + userEmail + "\",\"first_name\": \"" + firstName + "\", " +
+                    "\"last_name\": \"" + lastName + "\",\"role\": \"parent\", \"signing_order\":1 } ], \"parse_form_fields\": false}"), "data");
+                // add file and directly upload it
+                var wc = new WebClient();
+                var content = wc.DownloadData(fileUrl);
+                var stream = new MemoryStream(content);
+
+                multiForm.Add(new StreamContent(stream), "file", Path.GetFileName(fileUrl));
+
+                // send request to API
+                var response = client.PostAsync(createApi, multiForm).Result;
+                response.EnsureSuccessStatusCode();
+                PandDocCreateResponse createResponse = new PandDocCreateResponse();
+                string responseBody = string.Empty;
+                if (response.IsSuccessStatusCode)
+                {
+                    responseBody = response.Content.ReadAsStringAsync().Result;
+                    createResponse = new JavaScriptSerializer().Deserialize<PandDocCreateResponse>(responseBody);
+                }
+                return createResponse.id;
+            }
+            catch (Exception ex)
+            {
+                return String.Empty;
+            }
+        }
+
+        /// <summary>
+        /// 2. When PS will approve then upload to panda doc. If PM approve then sent it to parents.
+        /// Refernece: https://developers.pandadoc.com/reference/share-document
+        /// </summary>
+        /// <param name="documentId"></param>
+        /// <returns></returns>
+        public static bool SendDocument(string documentId)
+        {
+            try
+            {
+                var sendApi = API_BASE_URL + "documents/" + documentId + "/send";
+                ServicePointManager.Expect100Continue = true;
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                HttpClient client = new HttpClient();
+                client.DefaultRequestHeaders.Add("Accept", "*/*");
+                client.DefaultRequestHeaders.Add("Authorization", API_KEY);
+
+                var body = new { silent = true };//if won't send email to user but change status from draft to sent. Sent is needed to lock the document.
+                var content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+                var result = client.PostAsync(sendApi, content).Result;
+                PandDocCreateResponse sendResponse = new PandDocCreateResponse();
+                if (result.IsSuccessStatusCode)
+                {
+                    string responseBody = result.Content.ReadAsStringAsync().Result;
+                    sendResponse = new JavaScriptSerializer().Deserialize<PandDocCreateResponse>(responseBody);
+                    if (sendResponse.id != null)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 3. Share document will create a session so parent can see it
+        /// Reference: https://developers.pandadoc.com/reference/share-document#link-to-a-document
+        /// </summary>
+        /// <param name="documentId"></param>
+        /// <returns></returns>
+        public static PandDocCreateResponse ShareDocument(string documentId, string recipientEmail)
+        {
+            var shareApi = API_BASE_URL + "documents/" + documentId + "/session";
+            ServicePointManager.Expect100Continue = true;
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            HttpClient client = new HttpClient();
+            client.DefaultRequestHeaders.Add("Accept", "*/*");
+            client.DefaultRequestHeaders.Add("Authorization", API_KEY);
+            var body = new { recipient = recipientEmail, lifetime = 31535999 };//1 year
+            var content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+            var result = client.PostAsync(shareApi, content).Result;
+            PandDocCreateResponse shareResponse = new PandDocCreateResponse();
+            if (result.IsSuccessStatusCode)
+            {
+                string responseBody = result.Content.ReadAsStringAsync().Result;
+                shareResponse = new JavaScriptSerializer().Deserialize<PandDocCreateResponse>(responseBody);
+                return shareResponse;
+            }
+            return shareResponse;
+        }
+
+        /// <summary>
+        /// 4. Download the file and save into the s3 and put path in database
+        /// Reference: https://developers.pandadoc.com/reference/download-document
+        /// </summary>
+        /// <param name="documentId"></param>
+        /// <returns></returns>
+        public static Stream DownloadDocument(string documentId)
+        {
+            var downloadApi = API_BASE_URL + "documents/" + documentId + "/download";
+            ServicePointManager.Expect100Continue = true;
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            HttpClient client = new HttpClient();
+            client.DefaultRequestHeaders.Add("Accept", "*/*");
+            client.DefaultRequestHeaders.Add("Authorization", API_KEY);
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/pdf"));
+            HttpResponseMessage response = client.GetAsync(downloadApi).Result;
+            if (response.IsSuccessStatusCode)
+            {
+                Stream responseBody = response.Content.ReadAsStreamAsync().Result;
+                return responseBody;
+            }
+            return null;
+
+        }
+    }
+}
